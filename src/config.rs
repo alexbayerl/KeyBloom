@@ -45,7 +45,7 @@ impl Default for Config {
 impl Config {
     /// Return the path to the config file
     fn config_path() -> PathBuf {
-        if let Some(proj_dirs) = ProjectDirs::from("com", "YourName", "rust-hue-sync") {
+        if let Some(proj_dirs) = ProjectDirs::from("com", "AlexanderBayerl", "KeyBloom") {
             proj_dirs.config_dir().join("config.toml")
         } else {
             PathBuf::from("config.toml")
