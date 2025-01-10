@@ -38,7 +38,7 @@ This script is adapted to my use with the G213 keyboard, but offers customizabil
 0. [Download, install and start the SDK OpenRGB Server](https://openrgb.org/releases.html)
 1. Clone the repository:
    ```bash
-   git clone https://github.com/YourUsername/KeyBloom.git
+   git clone https://github.com/alexbayerl/KeyBloom.git
    ```
 2. Build the project:
    ```bash
