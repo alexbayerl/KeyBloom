@@ -1,0 +1,961 @@
+C:\Users\Alex\Dev\Screenbloom 2\KeyBloom\src\color_utils.rs:"//! Provides utility functions for converting and manipulating colors between different color spaces.
+//!
+//! This module wraps conversions between the OpenRGB `Color` type and the `palette` crate’s
+//! `Srgb` and `Hsv` color spaces. It also includes functions for color interpolation and
+//! adjustments (brightness and saturation).
+
+use openrgb::data::Color;
+use palette::{FromColor, Hsv, RgbHue, Srgb};
+
+/// Convert an OpenRGB `Color` to a palette `Srgb<f32>`.
+///
+/// # Arguments
+///
+/// * `color` - An OpenRGB `Color` struct containing RGB values in `u8` (0-255).
+///
+/// # Returns
+///
+/// An `Srgb<f32>` with all components normalized to 0.0-1.0.
+pub fn color_to_srgb(color: Color) -> Srgb<f32> {
+    Srgb::new(
+        color.r as f32 / 255.0,
+        color.g as f32 / 255.0,
+        color.b as f32 / 255.0,
+    )
+}
+
+/// Convert a palette `Srgb<f32>` to an OpenRGB `Color`.
+///
+/// # Arguments
+///
+/// * `srgb` - A color in `Srgb<f32>` format.
+///
+/// # Returns
+///
+/// An OpenRGB `Color` struct with RGB values clamped and converted to `u8` (0-255).
+pub fn srgb_to_color(srgb: Srgb<f32>) -> Color {
+    let r = (srgb.red * 255.0).clamp(0.0, 255.0).round() as u8;
+    let g = (srgb.green * 255.0).clamp(0.0, 255.0).round() as u8;
+    let b = (srgb.blue * 255.0).clamp(0.0, 255.0).round() as u8;
+    Color { r, g, b }
+}
+
+/// Convert an `Srgb<f32>` to `Hsv`.
+///
+/// # Arguments
+///
+/// * `s` - A color in `Srgb<f32>` format.
+///
+/// # Returns
+///
+/// A color in the `Hsv` color space for easier manipulation of hue, saturation, and value.
+pub fn srgb_to_hsv(s: Srgb<f32>) -> Hsv {
+    Hsv::from_color(s)
+}
+
+/// Convert an `Hsv` color to `Srgb<f32>`.
+///
+/// # Arguments
+///
+/// * `hsv` - A color in `Hsv` format.
+///
+/// # Returns
+///
+/// An `Srgb<f32>` representation of the same color.
+pub fn hsv_to_srgb(hsv: Hsv) -> Srgb<f32> {
+    Srgb::from_color(hsv)
+}
+
+/// Interpolate between two colors in HSV space.
+///
+/// This function calculates an intermediate color based on the given step.
+/// If hue values wrap around (e.g., from 350° to 10°), the function
+/// automatically adjusts for the shortest rotation direction.
+///
+/// # Arguments
+///
+/// * `start` - The starting color (`Srgb<f32>`).
+/// * `end` - The ending color (`Srgb<f32>`).
+/// * `step` - The current step in the interpolation (0-based).
+/// * `total_steps` - The total number of steps for the entire interpolation.
+///
+/// # Returns
+///
+/// An `Srgb<f32>` that represents the color at the given interpolation step.
+pub fn interpolate_color_hsv(
+    start: Srgb<f32>,
+    end: Srgb<f32>,
+    step: usize,
+    total_steps: usize,
+) -> Srgb<f32> {
+    if total_steps == 0 {
+        return start;
+    }
+
+    let shsv = srgb_to_hsv(start);
+    let ehsv = srgb_to_hsv(end);
+
+    // Handle potential hue wrap-around
+    let shue_deg = shsv.hue.into_degrees();
+    let ehue_deg = ehsv.hue.into_degrees();
+    let mut delta_hue = ehue_deg - shue_deg;
+
+    if delta_hue > 180.0 {
+        delta_hue -= 360.0;
+    } else if delta_hue < -180.0 {
+        delta_hue += 360.0;
+    }
+
+    let t = step as f32 / total_steps as f32;
+    let interp_hue = shue_deg + delta_hue * t;
+    let interp_saturation = shsv.saturation + (ehsv.saturation - shsv.saturation) * t;
+    let interp_value = shsv.value + (ehsv.value - shsv.value) * t;
+
+    hsv_to_srgb(Hsv::new(
+        RgbHue::from_degrees(interp_hue.rem_euclid(360.0)),
+        interp_saturation.clamp(0.0, 1.0),
+        interp_value.clamp(0.0, 1.0),
+    ))
+}
+
+/// Increase the saturation of an `Srgb<f32>` color by a given factor, clamping at 1.0.
+///
+/// # Arguments
+///
+/// * `srgb` - A color in `Srgb<f32>` format.
+/// * `factor` - The factor by which to multiply the saturation.
+///
+/// # Returns
+///
+/// A new color in `Srgb<f32>` with modified saturation.
+pub fn adjust_saturation(srgb: Srgb<f32>, factor: f32) -> Srgb<f32> {
+    let hsv = srgb_to_hsv(srgb);
+    let new_sat = (hsv.saturation * factor).clamp(0.0, 1.0);
+    hsv_to_srgb(Hsv::new(hsv.hue, new_sat, hsv.value))
+}
+
+/// Increase the brightness of an `Srgb<f32>` color by a given factor, clamping at 1.0.
+///
+/// # Arguments
+///
+/// * `srgb` - A color in `Srgb<f32>` format.
+/// * `factor` - The factor by which to multiply the brightness (value).
+///
+/// # Returns
+///
+/// A new color in `Srgb<f32>` with an adjusted brightness.
+pub fn increase_brightness(srgb: Srgb<f32>, factor: f32) -> Srgb<f32> {
+    let hsv = srgb_to_hsv(srgb);
+    let new_val = (hsv.value * factor).clamp(0.0, 1.0);
+    hsv_to_srgb(Hsv::new(hsv.hue, hsv.saturation, new_val))
+}"
+C:\Users\Alex\Dev\Screenbloom 2\KeyBloom\src\config.rs:"use serde::{Deserialize, Serialize};
+use std::fs;
+use std::io;
+use std::path::PathBuf;
+
+use directories::ProjectDirs;
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct Config {
+    pub num_leds: usize,
+    pub transition_steps: usize,
+    pub transition_delay_ms: u64,
+    pub frame_delay_ms: u64,
+    pub sample_step: usize,
+    pub color_change_threshold: f32,
+    pub brightness_factor: f32,
+    pub saturation_factor: f32,
+    pub debounce_duration_ms: u64,
+    pub openrgb_host: String,
+    pub openrgb_port: u16,
+    pub device_name: String,
+    pub monitor_index: usize,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            num_leds: 5,
+            transition_steps: 10,
+            transition_delay_ms: 15,
+            frame_delay_ms: 100,
+            sample_step: 10,
+            color_change_threshold: 0.05,
+            brightness_factor: 5.0,
+            saturation_factor: 4.0,
+            debounce_duration_ms: 500,
+            openrgb_host: "localhost".to_string(),
+            openrgb_port: 6742,
+            device_name: "G213".to_string(),
+            monitor_index: 1,
+        }
+    }
+}
+
+impl Config {
+    /// Return the path to the config file
+    fn config_path() -> PathBuf {
+        if let Some(proj_dirs) = ProjectDirs::from("com", "AlexanderBayerl", "KeyBloom") {
+            proj_dirs.config_dir().join("config.toml")
+        } else {
+            PathBuf::from("config.toml")
+        }
+    }
+
+    /// Load configuration or create a default one
+    pub fn load() -> Self {
+        let path = Self::config_path();
+        if path.exists() {
+            match fs::read_to_string(&path) {
+                Ok(content) => toml::from_str(&content).unwrap_or_default(),
+                Err(_) => Self::default(),
+            }
+        } else {
+            let config = Self::default();
+            // Save a new default config
+            let _ = config.save();
+            config
+        }
+    }
+
+    /// Save configuration to disk
+    pub fn save(&self) -> io::Result<()> {
+        let path = Self::config_path();
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let content = toml::to_string_pretty(self).expect("Failed to serialize config");
+        fs::write(&path, content)
+    }
+}
+"
+C:\Users\Alex\Dev\Screenbloom 2\KeyBloom\src\main.rs:"//! Main entry point for KeyBloom.
+//!
+//! This file sets up asynchronous runtime with `tokio`,
+//! loads or creates a default configuration, and presents a TUI menu
+//! for configuration editing. After the user exits the menu,
+//! the sync loop starts.
+
+mod color_utils;
+mod config;
+mod sync_loop;
+mod ui;
+
+use crate::config::Config;
+use crate::sync_loop::{start_sync_loop, SyncLoopExit};
+use crate::ui::show_menu;
+use std::error::Error;
+
+/// Asynchronous main function for KeyBloom.
+///
+/// Launches the TUI menu, lets the user configure settings, and then starts
+/// the synchronization loop that captures screen colors and updates the
+/// OpenRGB device in real-time.
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn Error>> {
+    // Load or create default config
+    let mut config = Config::load();
+
+    loop {
+        // Show TUI menu for editing config
+        if let Err(err) = show_menu(&mut config) {
+            eprintln!("Menu error: {err}");
+        }
+
+        // Start the sync loop using the (possibly updated) configuration
+        match start_sync_loop(&config).await? {
+            SyncLoopExit::ReturnToMenu => {
+                continue;
+            }
+            SyncLoopExit::Quit => {
+                break;
+            }
+        }
+    }
+    Ok(())
+}"
+C:\Users\Alex\Dev\Screenbloom 2\KeyBloom\src\sync_loop.rs:"//! Core logic for capturing screen colors and updating the OpenRGB device.
+//!
+//! The `start_sync_loop` function handles the following:
+//! 1. Connect to the OpenRGB server.
+//! 2. Identify the chosen device (keyboard, etc.).
+//! 3. Capture the screen from the selected monitor.
+//! 4. Compute average colors across screen segments.
+//! 5. Transition the keyboard LEDs smoothly to those colors.
+//!
+//! The loop continues until the user presses 'm' to return to menu or 'q' to quit.
+
+use crate::color_utils::*;
+use crate::config::Config;
+use image::RgbaImage;
+use openrgb::{data::Color, OpenRGB, OpenRGBError};
+use palette::Srgb;
+use rayon::prelude::*;
+use std::error::Error;
+use std::time::{Duration, Instant};
+use tokio::time::sleep;
+use xcap::Monitor;
+
+/// Return signals for the sync loop indicating if we should quit or return to menu.
+pub enum SyncLoopExit {
+    /// Return the user to the menu.
+    ReturnToMenu,
+    /// Quit the entire application.
+    Quit,
+}
+
+/// The main synchronization loop.
+///
+/// This function connects to the OpenRGB server, finds the device specified by the user,
+/// selects the desired monitor for screen capture, and continuously updates the device LEDs
+/// based on the average color of different vertical segments of the screen.
+///
+/// # Arguments
+///
+/// * `config` - A reference to the current KeyBloom configuration.
+///
+/// # Returns
+///
+/// A `SyncLoopExit` indicating whether the user wants to return to the menu or quit altogether.
+pub async fn start_sync_loop(config: &Config) -> Result<SyncLoopExit, Box<dyn Error>> {
+    // 1) Connect to OpenRGB
+    let client = match OpenRGB::connect_to((&config.openrgb_host[..], config.openrgb_port)).await {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("Failed to connect to OpenRGB server: {e}");
+            return Ok(SyncLoopExit::ReturnToMenu);
+        }
+    };
+    client.set_name("KeyBloom".to_string()).await?;
+
+    // 2) Find the specified device
+    let controller_count = client.get_controller_count().await?;
+    let mut keyboard_id: Option<u32> = None;
+    for i in 0..controller_count {
+        if let Ok(ctrl) = client.get_controller(i).await {
+            if ctrl.name.contains(&config.device_name)
+                || ctrl.name.to_lowercase().contains("keyboard")
+            {
+                keyboard_id = Some(i);
+                break;
+            }
+        }
+    }
+    let kb_id = match keyboard_id {
+        Some(id) => id,
+        None => {
+            eprintln!(
+                "No device named '{}' found. Check your OpenRGB server.",
+                config.device_name
+            );
+            return Ok(SyncLoopExit::ReturnToMenu);
+        }
+    };
+
+    // Attempt to set custom mode (if supported)
+    if let Err(e) = client.set_custom_mode(kb_id).await {
+        eprintln!("Could not set custom mode on device: {e}");
+    }
+
+    // 3) Select monitor for screen capture
+    let monitors = Monitor::all().map_err(|e| format!("xcap error: {e}"))?;
+    let monitor = monitors
+        .get(config.monitor_index)
+        .unwrap_or_else(|| &monitors[0])
+        .clone();
+
+    println!(
+        "\nSync started on monitor: {} ({}x{}), device: {}. Press 'm' to return to menu, 'q' to quit.\n",
+        monitor.name(),
+        monitor.width(),
+        monitor.height(),
+        config.device_name
+    );
+
+    let mut current_colors = vec![Color { r: 0, g: 0, b: 0 }; config.num_leds];
+    let mut last_transition = Instant::now();
+    let mut step_buffer = vec![Color { r: 0, g: 0, b: 0 }; config.num_leds];
+    let color_threshold_sq = (config.color_change_threshold * 255.0).powi(2);
+
+    // Main capture-and-update loop
+    loop {
+        // Quick user input check
+        if crossterm::event::poll(Duration::from_millis(1))? {
+            if let crossterm::event::Event::Key(key) = crossterm::event::read()? {
+                if key.kind == crossterm::event::KeyEventKind::Press {
+                    match key.code {
+                        crossterm::event::KeyCode::Char('m') => {
+                            return Ok(SyncLoopExit::ReturnToMenu);
+                        }
+                        crossterm::event::KeyCode::Char('q') => {
+                            return Ok(SyncLoopExit::Quit);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+
+        // Capture screen
+        let loop_start = Instant::now();
+        let frame: RgbaImage = match monitor.capture_image() {
+            Ok(img) => img,
+            Err(e) => {
+                eprintln!("Capture error: {e}");
+                sleep(Duration::from_millis(config.frame_delay_ms)).await;
+                continue;
+            }
+        };
+        let width = frame.width();
+        let height = frame.height();
+
+        // Sum up pixel values in vertical segments
+        let mut sums = vec![(0u64, 0u64, 0u64, 0u64); config.num_leds];
+        for y in 0..height {
+            for x in 0..width {
+                let pixel = frame.get_pixel(x, y);
+                let alpha = pixel[3] as f32 / 255.0;
+                if alpha >= 0.1 {
+                    let col_idx = (x as usize * config.num_leds) / width as usize;
+                    let (r, g, b, c) = &mut sums[col_idx];
+                    *r += pixel[0] as u64;
+                    *g += pixel[1] as u64;
+                    *b += pixel[2] as u64;
+                    *c += 1;
+                }
+            }
+        }
+
+        // Convert sums to target colors, adjusting brightness & saturation
+        let target_srgb: Vec<Srgb<f32>> = sums
+            .into_par_iter()
+            .map(|(r_sum, g_sum, b_sum, count)| {
+                if count == 0 {
+                    Srgb::new(0.0, 0.0, 0.0)
+                } else {
+                    let count_f = count as f32;
+                    let r_f = (r_sum as f32 / count_f) / 255.0;
+                    let g_f = (g_sum as f32 / count_f) / 255.0;
+                    let b_f = (b_sum as f32 / count_f) / 255.0;
+                    let avg = Srgb::new(r_f, g_f, b_f);
+                    let bright = increase_brightness(avg, config.brightness_factor);
+                    adjust_saturation(bright, config.saturation_factor)
+                }
+            })
+            .collect();
+        let target_colors: Vec<Color> = target_srgb.iter().map(|&c| srgb_to_color(c)).collect();
+
+        // Check if a significant color change occurred
+        let significant_change = current_colors
+            .iter()
+            .zip(&target_colors)
+            .any(|(curr, targ)| {
+                let dr = targ.r as f32 - curr.r as f32;
+                let dg = targ.g as f32 - curr.g as f32;
+                let db = targ.b as f32 - curr.b as f32;
+                let dist_sq = dr * dr + dg * dg + db * db;
+                dist_sq > color_threshold_sq
+            });
+
+        let debounce_passed =
+            last_transition.elapsed() >= Duration::from_millis(config.debounce_duration_ms);
+
+        // If there's a big enough change and we've passed the debounce time, do a transition
+        if significant_change && debounce_passed {
+            if let Err(e) = smooth_transition(
+                &client,
+                kb_id,
+                &mut current_colors,
+                &target_colors,
+                config,
+                &mut step_buffer,
+            )
+            .await
+            {
+                eprintln!("Error updating keyboard LEDs: {e}");
+            }
+            last_transition = Instant::now();
+        }
+
+        // Honor frame delay
+        let elapsed = loop_start.elapsed();
+        if let Some(remaining) = Duration::from_millis(config.frame_delay_ms).checked_sub(elapsed) {
+            sleep(remaining).await;
+        }
+    }
+}
+
+/// Smoothly transition `current` colors to `target` colors using HSV interpolation.
+/// 
+/// This function performs several incremental steps (specified in `config.transition_steps`)
+/// and updates the keyboard LEDs at each step.
+///
+/// # Arguments
+///
+/// * `openrgb_client` - A reference to the connected OpenRGB client.
+/// * `controller_id` - The numeric ID of the device being controlled.
+/// * `current` - A mutable reference to the slice of current LED colors.
+/// * `target` - A slice of target LED colors.
+/// * `config` - The application configuration (`Config`).
+/// * `step_buffer` - A mutable buffer used to store intermediate colors during each interpolation step.
+///
+/// # Returns
+///
+/// A `Result` indicating success or an `OpenRGBError`.
+async fn smooth_transition(
+    openrgb_client: &OpenRGB<tokio::net::TcpStream>,
+    controller_id: u32,
+    current: &mut [Color],
+    target: &[Color],
+    config: &Config,
+    step_buffer: &mut [Color],
+) -> Result<(), OpenRGBError> {
+    if current.len() != target.len() || current.is_empty() {
+        return Ok(());
+    }
+    let curr_srgb: Vec<Srgb<f32>> = current.iter().map(|&c| color_to_srgb(c)).collect();
+    let targ_srgb: Vec<Srgb<f32>> = target.iter().map(|&c| color_to_srgb(c)).collect();
+
+    for step in 1..=config.transition_steps {
+        for (i, (cs, ts)) in curr_srgb.iter().zip(targ_srgb.iter()).enumerate() {
+            let new_color = interpolate_color_hsv(*cs, *ts, step, config.transition_steps);
+            step_buffer[i] = srgb_to_color(new_color);
+        }
+        openrgb_client.update_leds(controller_id, step_buffer.to_vec()).await?;
+        current.copy_from_slice(step_buffer);
+        tokio::time::sleep(Duration::from_millis(config.transition_delay_ms)).await;
+    }
+    Ok(())
+}
+"
+C:\Users\Alex\Dev\Screenbloom 2\KeyBloom\src\ui.rs:"//! Terminal User Interface (TUI) for KeyBloom.
+//!
+//! This file defines the interactive menu for editing the
+//! `Config` fields. It uses `ratatui` (based on `tui-rs`) and
+//! `crossterm` for handling user input in a terminal environment.
+
+use std::io;
+use std::time::{Duration, Instant};
+
+use crossterm::event::{
+    self, DisableMouseCapture, EnableMouseCapture, Event as CEvent, KeyCode, KeyEventKind,
+};
+use crossterm::execute;
+use crossterm::terminal::{
+    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+};
+use ratatui::backend::{Backend, CrosstermBackend};
+use ratatui::layout::{Alignment, Constraint, Direction, Layout};
+use ratatui::style::{Color as RColor, Modifier, Style};
+use ratatui::style::Color::Rgb;
+use ratatui::widgets::{Block, BorderType, Borders, List, ListItem, Paragraph};
+use ratatui::{Frame, Terminal};
+
+use crate::config::Config;
+
+/// Represents the TUI's input mode for editing a configuration field or just navigating.
+#[derive(Debug, PartialEq)]
+pub enum InputMode {
+    /// Normal navigation mode.
+    Normal,
+    /// Editing mode for the currently selected configuration field.
+    Editing,
+}
+
+/// The main application state for the TUI.
+pub struct App {
+    /// The active configuration for KeyBloom.
+    pub config: Config,
+    /// List of configuration options in textual form.
+    pub options: Vec<&'static str>,
+    /// Descriptions for each configuration option to display to the user.
+    pub descriptions: Vec<&'static str>,
+    /// Indicates whether we're in `Normal` or `Editing` mode.
+    pub input_mode: InputMode,
+    /// The temporary buffer that holds user input when editing.
+    pub input: String,
+    /// Stores the currently selected item in the list for navigation.
+    pub list_state: ratatui::widgets::ListState,
+    /// Indicates whether the UI needs to be redrawn.
+    pub dirty: bool,
+}
+
+impl App {
+    /// Create a new `App` instance from a given `Config`.
+    pub fn new(config: Config) -> Self {
+        let mut list_state = ratatui::widgets::ListState::default();
+        list_state.select(Some(0));
+        App {
+            config,
+            options: vec![
+                "Number of LEDs",
+                "Transition Steps",
+                "Transition Delay (ms)",
+                "Frame Delay (ms)",
+                "Color Change Threshold",
+                "Brightness Factor",
+                "Saturation Factor",
+                "Debounce Duration (ms)",
+                "OpenRGB Host",
+                "OpenRGB Port",
+                "Device Name",
+                "Monitor Index",
+                "Save and Sync",
+            ],
+            descriptions: vec![
+                "Set the number of LEDs on your device.",
+                "Define how many steps the color transition should take.",
+                "Specify the delay (ms) between each transition step.",
+                "Set the delay (ms) between each frame capture.",
+                "Threshold for significant color changes (0.0-1.0).",
+                "Factor to adjust overall brightness (larger = brighter).",
+                "Factor to adjust color saturation (larger = more vibrant).",
+                "Minimum duration (ms) between transitions to prevent rapid changes.",
+                "Hostname or IP of the OpenRGB server.",
+                "Port number of the OpenRGB server.",
+                "Name of the OpenRGB device to control.",
+                "Index of the monitor to capture (0-based).",
+                "Save current configuration and exit the menu.",
+            ],
+            input_mode: InputMode::Normal,
+            input: String::new(),
+            list_state,
+            dirty: true,
+        }
+    }
+
+    /// Move selection down in the options list.
+    pub fn next(&mut self) {
+        if let Some(selected) = self.list_state.selected() {
+            let next = if selected >= self.options.len() - 1 { 0 } else { selected + 1 };
+            self.list_state.select(Some(next));
+            self.dirty = true;
+        }
+    }
+
+    /// Move selection up in the options list.
+    pub fn previous(&mut self) {
+        if let Some(selected) = self.list_state.selected() {
+            let prev = if selected == 0 {
+                self.options.len() - 1
+            } else {
+                selected - 1
+            };
+            self.list_state.select(Some(prev));
+            self.dirty = true;
+        }
+    }
+
+    /// Toggle between editing the currently selected field and normal navigation.
+    ///
+    /// When toggling to `Editing`, the current config value is loaded into `self.input`.
+    /// When toggling back to `Normal`, `self.input` is cleared.
+    pub fn toggle_edit(&mut self) {
+        self.input_mode = match self.input_mode {
+            InputMode::Normal => InputMode::Editing,
+            InputMode::Editing => InputMode::Normal,
+        };
+        if self.input_mode == InputMode::Editing {
+            let selected = self.list_state.selected().unwrap_or(0);
+            self.input = match selected {
+                0 => self.config.num_leds.to_string(),
+                1 => self.config.transition_steps.to_string(),
+                2 => self.config.transition_delay_ms.to_string(),
+                3 => self.config.frame_delay_ms.to_string(),
+                4 => self.config.color_change_threshold.to_string(),
+                5 => self.config.brightness_factor.to_string(),
+                6 => self.config.saturation_factor.to_string(),
+                7 => self.config.debounce_duration_ms.to_string(),
+                8 => self.config.openrgb_host.clone(),
+                9 => self.config.openrgb_port.to_string(),
+                10 => self.config.device_name.clone(),
+                11 => self.config.monitor_index.to_string(),
+                _ => "".to_string(),
+            };
+        } else {
+            self.input.clear();
+        }
+        self.dirty = true;
+    }
+
+    /// Update the `config` with the contents of `self.input` for the selected option.
+    ///
+    /// This method attempts to parse the input for numeric fields or assigns
+    /// it directly for string fields. If parsing fails, the old value is retained.
+    pub fn update_config(&mut self) {
+        if let Some(selected) = self.list_state.selected() {
+            match selected {
+                0 => {
+                    self.config.num_leds = self.input.parse().unwrap_or(self.config.num_leds);
+                }
+                1 => {
+                    self.config.transition_steps =
+                        self.input.parse().unwrap_or(self.config.transition_steps);
+                }
+                2 => {
+                    self.config.transition_delay_ms =
+                        self.input.parse().unwrap_or(self.config.transition_delay_ms);
+                }
+                3 => {
+                    self.config.frame_delay_ms =
+                        self.input.parse().unwrap_or(self.config.frame_delay_ms);
+                }
+                4 => {
+                    self.config.color_change_threshold =
+                        self.input.parse().unwrap_or(self.config.color_change_threshold);
+                }
+                5 => {
+                    self.config.brightness_factor =
+                        self.input.parse().unwrap_or(self.config.brightness_factor);
+                }
+                6 => {
+                    self.config.saturation_factor =
+                        self.input.parse().unwrap_or(self.config.saturation_factor);
+                }
+                7 => {
+                    self.config.debounce_duration_ms =
+                        self.input.parse().unwrap_or(self.config.debounce_duration_ms);
+                }
+                8 => {
+                    self.config.openrgb_host = self.input.clone();
+                }
+                9 => {
+                    self.config.openrgb_port =
+                        self.input.parse().unwrap_or(self.config.openrgb_port);
+                }
+                10 => {
+                    self.config.device_name = self.input.clone();
+                }
+                11 => {
+                    self.config.monitor_index =
+                        self.input.parse().unwrap_or(self.config.monitor_index);
+                }
+                _ => {}
+            }
+        }
+        self.dirty = true;
+    }
+}
+
+/// Draws the main TUI layout onto the frame.
+///
+/// # Arguments
+///
+/// * `f` - The frame to draw onto.
+/// * `app` - The current state of the TUI application.
+pub fn ui(f: &mut Frame, app: &mut App) {
+    let area = f.area();
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .margin(1)
+        .constraints([
+            Constraint::Length(6),
+            Constraint::Min(10),
+            Constraint::Length(5),
+            Constraint::Length(3),
+            Constraint::Length(2),
+            Constraint::Length(1),
+        ])
+        .split(area);
+
+        let ascii_art = r#"         _  __          ____  _                       
+        | |/ /___ _   _| __ )| | ___   ___  _ __ ___  
+        | ' // _ \ | | |  _ \| |/ _ \ / _ \| '_ ` _ \ 
+        | . \  __/ |_| | |_) | | (_) | (_) | | | | | |
+        |_|\_\___|\__, |____/|_|\___/ \___/|_| |_| |_|
+                  |___/                               "#;
+
+    let header_block = Block::default().borders(Borders::NONE);
+    let header_paragraph = Paragraph::new(ascii_art)
+        .block(header_block)
+        .alignment(Alignment::Center)
+        .style(Style::default().fg(RColor::Yellow));
+    f.render_widget(header_paragraph, chunks[0]);
+
+    // Configuration options list
+    let items: Vec<ListItem> = app
+        .options
+        .iter()
+        .map(|opt| ListItem::new(*opt).style(
+            Style::default()
+                .fg(RColor::White)
+                .add_modifier(Modifier::BOLD),
+        ))
+        .collect();
+
+    let list = List::new(items)
+        .block(
+            Block::default()
+                .title("Configuration Options")
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .title_alignment(Alignment::Center),
+        )
+        .highlight_style(
+            Style::default()
+                .fg(RColor::Black)
+                .bg(RColor::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )
+        .highlight_symbol(">> ");
+    f.render_stateful_widget(list, chunks[1], &mut app.list_state);
+
+    // Description of currently selected option
+    let selected = app.list_state.selected().unwrap_or(0);
+    let description = if selected < app.descriptions.len() {
+        app.descriptions[selected]
+    } else {
+        ""
+    };
+    let desc_block = Block::default()
+        .title("Option Description")
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .title_alignment(Alignment::Center);
+    let desc_paragraph = Paragraph::new(description)
+        .block(desc_block)
+        .style(Style::default().fg(RColor::LightBlue))
+        .alignment(Alignment::Left);
+    f.render_widget(desc_paragraph, chunks[2]);
+
+    // Input/edit area
+    let input_block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded);
+
+    if app.input_mode == InputMode::Editing {
+        let editing_block = input_block
+            .clone()
+            .title("Edit Value")
+            .title_alignment(Alignment::Center);
+        let input_widget = Paragraph::new(app.input.as_str())
+            .block(editing_block)
+            .style(Style::default().fg(RColor::Green))
+            .alignment(Alignment::Left);
+        f.render_widget(input_widget, chunks[3]);
+
+        // Place the cursor at the end of the input
+        let cursor_x = chunks[3].x + app.input.len() as u16 + 1;
+        let cursor_y = chunks[3].y + 1;
+        f.set_cursor_position((cursor_x, cursor_y));
+    } else {
+        let help_block = input_block
+            .title("Instructions")
+            .title_alignment(Alignment::Center);
+        let info_text = "Press 'q' to exit. Use ↑↓ to navigate. Press Enter to edit.";
+        let info = Paragraph::new(info_text)
+            .block(help_block)
+            .style(Style::default().fg(RColor::Gray))
+            .alignment(Alignment::Center);
+        f.render_widget(info, chunks[3]);
+    }
+
+    // Author signature
+    let author_paragraph = Paragraph::new("Alexander Bayerl | With ❤️ from Austria")
+        .style(Style::default().fg(Rgb(255, 214, 0)))
+        .alignment(Alignment::Right);
+    f.render_widget(author_paragraph, chunks[5]);
+}
+
+/// Runs the TUI application loop, handling events and rendering.
+///
+/// # Arguments
+///
+/// * `terminal` - A mutable reference to a `Terminal` that uses the provided backend.
+/// * `app` - The TUI application state.
+pub fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app: App) -> io::Result<()> {
+    let tick_rate = Duration::from_millis(200);
+    let mut last_tick = Instant::now();
+    let mut should_quit = false;
+
+    while !should_quit {
+        let now = Instant::now();
+        let timeout = tick_rate
+            .checked_sub(last_tick.elapsed())
+            .unwrap_or_else(|| Duration::from_secs(0));
+
+        if app.dirty || last_tick.elapsed() >= tick_rate {
+            terminal.draw(|f| ui(f, &mut app))?;
+            app.dirty = false;
+            last_tick = now;
+        }
+
+        if event::poll(timeout)? {
+            if let CEvent::Key(key) = event::read()? {
+                if key.kind == KeyEventKind::Press {
+                    match app.input_mode {
+                        InputMode::Normal => match key.code {
+                            KeyCode::Char('q') => {
+                                should_quit = true;
+                            }
+                            KeyCode::Down => {
+                                app.next();
+                            }
+                            KeyCode::Up => {
+                                app.previous();
+                            }
+                            KeyCode::Enter => {
+                                if let Some(selected) = app.list_state.selected() {
+                                    // "Save and Sync" is the last option
+                                    if selected == app.options.len() - 1 {
+                                        let _ = app.config.save();
+                                        should_quit = true;
+                                    } else {
+                                        app.toggle_edit();
+                                    }
+                                }
+                            }
+                            _ => {}
+                        },
+                        InputMode::Editing => match key.code {
+                            KeyCode::Enter => {
+                                app.update_config();
+                                app.toggle_edit();
+                            }
+                            KeyCode::Char(c) => {
+                                app.input.push(c);
+                                app.dirty = true;
+                            }
+                            KeyCode::Backspace => {
+                                app.input.pop();
+                                app.dirty = true;
+                            }
+                            KeyCode::Esc => {
+                                app.toggle_edit();
+                            }
+                            _ => {}
+                        },
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Launches the TUI menu in raw mode and restores the terminal upon exit.
+///
+/// # Arguments
+///
+/// * `config` - A mutable reference to the current KeyBloom configuration.
+pub fn show_menu(config: &mut Config) -> io::Result<()> {
+    enable_raw_mode()?;
+    let mut stdout = io::stdout();
+    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+    let backend = CrosstermBackend::new(stdout);
+    let mut terminal = Terminal::new(backend)?;
+
+    let app = App::new(config.clone());
+    let res = run_app(&mut terminal, app);
+
+    disable_raw_mode()?;
+    execute!(
+        terminal.backend_mut(),
+        LeaveAlternateScreen,
+        DisableMouseCapture
+    )?;
+    terminal.show_cursor()?;
+
+    res
+}"

@@ -214,7 +214,7 @@ impl App {
 /// * `f` - The frame to draw onto.
 /// * `app` - The current state of the TUI application.
 pub fn ui(f: &mut Frame, app: &mut App) {
-    let area = f.area();
+    let area = f.size();
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .margin(1)
@@ -228,7 +228,7 @@ pub fn ui(f: &mut Frame, app: &mut App) {
         ])
         .split(area);
 
-        let ascii_art = r#"         _  __          ____  _                       
+    let ascii_art = r#"         _  __          ____  _                       
         | |/ /___ _   _| __ )| | ___   ___  _ __ ___  
         | ' // _ \ | | |  _ \| |/ _ \ / _ \| '_ ` _ \ 
         | . \  __/ |_| | |_) | | (_) | (_) | | | | | |
@@ -307,7 +307,7 @@ pub fn ui(f: &mut Frame, app: &mut App) {
         // Place the cursor at the end of the input
         let cursor_x = chunks[3].x + app.input.len() as u16 + 1;
         let cursor_y = chunks[3].y + 1;
-        f.set_cursor_position((cursor_x, cursor_y));
+        f.set_cursor(cursor_x, cursor_y);
     } else {
         let help_block = input_block
             .title("Instructions")
@@ -333,7 +333,7 @@ pub fn ui(f: &mut Frame, app: &mut App) {
 ///
 /// * `terminal` - A mutable reference to a `Terminal` that uses the provided backend.
 /// * `app` - The TUI application state.
-pub fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app: App) -> io::Result<()> {
+pub fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app: App) -> io::Result<App> {
     let tick_rate = Duration::from_millis(200);
     let mut last_tick = Instant::now();
     let mut should_quit = false;
@@ -368,8 +368,15 @@ pub fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app: App) -> io::Resu
                                 if let Some(selected) = app.list_state.selected() {
                                     // "Save and Sync" is the last option
                                     if selected == app.options.len() - 1 {
-                                        let _ = app.config.save();
-                                        should_quit = true;
+                                        match app.config.save() {
+                                            Ok(_) => {
+                                                eprintln!("Configuration saved successfully.");
+                                                should_quit = true;
+                                            }
+                                            Err(err) => {
+                                                eprintln!("Failed to save configuration: {}", err);
+                                            }
+                                        }
                                     } else {
                                         app.toggle_edit();
                                     }
@@ -400,7 +407,8 @@ pub fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app: App) -> io::Resu
             }
         }
     }
-    Ok(())
+
+    Ok(app) // Return the updated App
 }
 
 /// Launches the TUI menu in raw mode and restores the terminal upon exit.
@@ -416,7 +424,9 @@ pub fn show_menu(config: &mut Config) -> io::Result<()> {
     let mut terminal = Terminal::new(backend)?;
 
     let app = App::new(config.clone());
-    let res = run_app(&mut terminal, app);
+    let updated_app = run_app(&mut terminal, app)?; // Receive the updated App
+
+    *config = updated_app.config; // Update the main Config with changes from the TUI
 
     disable_raw_mode()?;
     execute!(
@@ -426,5 +436,5 @@ pub fn show_menu(config: &mut Config) -> io::Result<()> {
     )?;
     terminal.show_cursor()?;
 
-    res
+    Ok(())
 }

@@ -74,7 +74,13 @@ impl Config {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
-        let content = toml::to_string_pretty(self).expect("Failed to serialize config");
-        fs::write(&path, content)
+        let content = toml::to_string_pretty(self).map_err(|err| {
+            eprintln!("Failed to serialize configuration: {}", err);
+            io::Error::new(io::ErrorKind::Other, "Serialization failed")
+        })?;
+        fs::write(&path, content).map_err(|err| {
+            eprintln!("Failed to save configuration to {}: {}", path.display(), err);
+            err
+        })
     }
 }
