@@ -7,7 +7,7 @@
 //! 4. Compute average colors across screen segments.
 //! 5. Transition the keyboard LEDs smoothly to those colors.
 //!
-//! The loop continues until the user presses 'm' to return to menu or 'q' to quit.
+//! The loop continues until aborted from outside (e.g., by calling `handle.abort()`).
 
 use crate::color_utils::*;
 use crate::config::Config;
@@ -15,17 +15,30 @@ use image::RgbaImage;
 use openrgb::{data::Color, OpenRGB, OpenRGBError};
 use palette::Srgb;
 use rayon::prelude::*; // For parallel iterators
-use std::error::Error;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::time::sleep;
 use xcap::Monitor;
+use std::sync::{Mutex, atomic::{AtomicBool, Ordering}};
 
-/// Return signals for the sync loop indicating if we should quit or return to menu.
-pub enum SyncLoopExit {
-    /// Return the user to the menu.
-    ReturnToMenu,
-    /// Quit the entire application.
-    Quit,
+// Define a new error type that implements Send + Sync + 'static
+type AnyError = Box<dyn std::error::Error + Send + Sync + 'static>;
+
+/// Represents the synchronization status shared between the sync loop and the UI.
+#[derive(Default)]
+pub struct SyncStatus {
+    pub is_running: bool,
+    pub current_colors: Vec<Color>,
+    pub frame_count: usize,
+    pub last_update: Option<Instant>,
+}
+
+impl SyncStatus {
+    pub fn update(&mut self, colors: Vec<Color>) {
+        self.current_colors = colors;
+        self.frame_count += 1;
+        self.last_update = Some(Instant::now());
+    }
 }
 
 /// The main synchronization loop.
@@ -34,20 +47,18 @@ pub enum SyncLoopExit {
 /// selects the desired monitor for screen capture, and continuously updates the device LEDs
 /// based on the average color of different vertical segments of the screen.
 ///
-/// # Arguments
-///
-/// * `config` - A reference to the current KeyBloom configuration.
-///
-/// # Returns
-///
-/// A `SyncLoopExit` indicating whether the user wants to return to the menu or quit altogether.
-pub async fn start_sync_loop(config: &Config) -> Result<SyncLoopExit, Box<dyn Error>> {
+/// It runs until externally aborted (e.g., via `handle.abort()`).
+pub async fn start_sync_loop(
+    config: &Config,
+    sync_status: Arc<Mutex<SyncStatus>>,
+    stop_signal: Arc<AtomicBool>, // NEW
+) -> Result<(), AnyError> {
     // 1) Connect to OpenRGB
     let client = match OpenRGB::connect_to((&config.openrgb_host[..], config.openrgb_port)).await {
         Ok(c) => c,
         Err(e) => {
             eprintln!("Failed to connect to OpenRGB server: {e}");
-            return Ok(SyncLoopExit::ReturnToMenu);
+            return Ok(()); // Gracefully return
         }
     };
     client.set_name("KeyBloom".to_string()).await?;
@@ -73,7 +84,7 @@ pub async fn start_sync_loop(config: &Config) -> Result<SyncLoopExit, Box<dyn Er
                 "No device named '{}' found. Check your OpenRGB server.",
                 config.device_name
             );
-            return Ok(SyncLoopExit::ReturnToMenu);
+            return Ok(()); // Gracefully return
         }
     };
 
@@ -90,7 +101,7 @@ pub async fn start_sync_loop(config: &Config) -> Result<SyncLoopExit, Box<dyn Er
         .clone();
 
     println!(
-        "\nSync started on monitor: {} ({}x{}), device: {}. Press 'm' to return to menu, 'q' to quit.\n",
+        "\nSync started on monitor: {} ({}x{}), device: {}.\n",
         monitor.name(),
         monitor.width(),
         monitor.height(),
@@ -102,26 +113,16 @@ pub async fn start_sync_loop(config: &Config) -> Result<SyncLoopExit, Box<dyn Er
     let mut step_buffer = vec![Color { r: 0, g: 0, b: 0 }; config.num_leds];
     let color_threshold_sq = (config.color_change_threshold * 255.0).powi(2);
     let width = monitor.width() as usize;
+    let height = monitor.height() as usize;
 
-    // Main capture-and-update loop
-    loop {
-        // Quick user input check
-        if crossterm::event::poll(Duration::from_millis(1))? {
-            if let crossterm::event::Event::Key(key) = crossterm::event::read()? {
-                if key.kind == crossterm::event::KeyEventKind::Press {
-                    match key.code {
-                        crossterm::event::KeyCode::Char('m') => {
-                            return Ok(SyncLoopExit::ReturnToMenu);
-                        }
-                        crossterm::event::KeyCode::Char('q') => {
-                            return Ok(SyncLoopExit::Quit);
-                        }
-                        _ => {}
-                    }
-                }
-            }
-        }
+    // For efficiency, we skip (x, y) coordinates by config.sample_step
+    let sampling_step = config.sample_step.max(1);
 
+    // Pre-allocate space for summation
+    let mut sums_accum = vec![(0u64, 0u64, 0u64, 0u64); config.num_leds];
+
+    // 4) Capture-and-update loop (runs until aborted)
+    while !stop_signal.load(Ordering::Relaxed) { // MODIFIED
         // Capture screen
         let loop_start = Instant::now();
         let frame: RgbaImage = match monitor.capture_image() {
@@ -133,11 +134,23 @@ pub async fn start_sync_loop(config: &Config) -> Result<SyncLoopExit, Box<dyn Er
             }
         };
 
-        let mut sums = frame
-            .par_chunks_exact(width * 4)
-            .map(|row_slice| {
+        // Reset accumulations
+        for accum in &mut sums_accum {
+            *accum = (0, 0, 0, 0);
+        }
+
+        // Compute average color in parallel
+        let final_sums = (0..height)
+            .into_par_iter()
+            .step_by(sampling_step)
+            .map(|row| {
+                let row_start = row * width * 4;
+                let row_slice = &frame.as_raw()[row_start..(row_start + width * 4)];
+
+                // Local partial sums for this row
                 let mut row_sums = vec![(0u64, 0u64, 0u64, 0u64); config.num_leds];
-                for x in 0..width {
+
+                for x in (0..width).step_by(sampling_step) {
                     let idx = x * 4;
                     let r = row_slice[idx] as u64;
                     let g = row_slice[idx + 1] as u64;
@@ -145,7 +158,6 @@ pub async fn start_sync_loop(config: &Config) -> Result<SyncLoopExit, Box<dyn Er
                     let a = row_slice[idx + 3] as f32 / 255.0;
 
                     if a >= 0.1 {
-                        // Which LED column does this pixel belong to?
                         let col_idx = (x * config.num_leds) / width;
                         let (rr, gg, bb, count) = &mut row_sums[col_idx];
                         *rr += r;
@@ -160,18 +172,19 @@ pub async fn start_sync_loop(config: &Config) -> Result<SyncLoopExit, Box<dyn Er
                 || vec![(0u64, 0u64, 0u64, 0u64); config.num_leds],
                 |mut acc, row_sums| {
                     for (i, (r, g, b, c)) in row_sums.into_iter().enumerate() {
-                        let s = &mut acc[i];
-                        s.0 += r;
-                        s.1 += g;
-                        s.2 += b;
-                        s.3 += c;
+                        let (rr, gg, bb, cc) = &mut acc[i];
+                        *rr += r;
+                        *gg += g;
+                        *bb += b;
+                        *cc += c;
                     }
                     acc
                 },
             );
 
-        // Convert sums to target colors, adjusting brightness & saturation
-        let target_srgb: Vec<Srgb<f32>> = sums
+        sums_accum.copy_from_slice(&final_sums);
+
+        let target_srgb: Vec<Srgb<f32>> = sums_accum
             .par_iter()
             .map(|&(r_sum, g_sum, b_sum, count)| {
                 if count == 0 {
@@ -190,7 +203,12 @@ pub async fn start_sync_loop(config: &Config) -> Result<SyncLoopExit, Box<dyn Er
 
         let target_colors: Vec<Color> = target_srgb.iter().map(|&c| srgb_to_color(c)).collect();
 
-        // Check if a significant color change occurred
+        {
+            let mut status = sync_status.lock().unwrap();
+            status.update(current_colors.clone());
+        }
+
+        // Check if color changed significantly
         let significant_change = current_colors
             .iter()
             .zip(&target_colors)
@@ -205,7 +223,6 @@ pub async fn start_sync_loop(config: &Config) -> Result<SyncLoopExit, Box<dyn Er
         let debounce_passed =
             last_transition.elapsed() >= Duration::from_millis(config.debounce_duration_ms);
 
-        // If there's a big enough change and we've passed the debounce time, do a transition
         if significant_change && debounce_passed {
             if let Err(e) = smooth_transition(
                 &client,
@@ -222,18 +239,22 @@ pub async fn start_sync_loop(config: &Config) -> Result<SyncLoopExit, Box<dyn Er
             last_transition = Instant::now();
         }
 
-        // Honor frame delay
+        {
+            let mut status = sync_status.lock().unwrap();
+            status.update(current_colors.clone());
+        }
+
         let elapsed = loop_start.elapsed();
         if let Some(remaining) = Duration::from_millis(config.frame_delay_ms).checked_sub(elapsed) {
             sleep(remaining).await;
         }
     }
+
+    println!("Sync loop asked to stop. Exiting normally...");
+    Ok(())
 }
 
 /// Smoothly transition `current` colors to `target` colors using HSV interpolation.
-///
-/// This function performs several incremental steps (specified in `config.transition_steps`)
-/// and updates the keyboard LEDs at each step.
 ///
 /// # Arguments
 ///
@@ -241,12 +262,8 @@ pub async fn start_sync_loop(config: &Config) -> Result<SyncLoopExit, Box<dyn Er
 /// * `controller_id` - The numeric ID of the device being controlled.
 /// * `current` - A mutable reference to the slice of current LED colors.
 /// * `target` - A slice of target LED colors.
-/// * `config` - The application configuration (`Config`).
-/// * `step_buffer` - A mutable buffer used to store intermediate colors during each interpolation step.
-///
-/// # Returns
-///
-/// A `Result` indicating success or an `OpenRGBError`.
+/// * `config` - The application configuration.
+/// * `step_buffer` - A mutable buffer used to store intermediate colors during each step.
 async fn smooth_transition(
     openrgb_client: &OpenRGB<tokio::net::TcpStream>,
     controller_id: u32,
@@ -262,10 +279,16 @@ async fn smooth_transition(
     let targ_srgb: Vec<Srgb<f32>> = target.iter().map(|&c| color_to_srgb(c)).collect();
 
     for step in 1..=config.transition_steps {
-        for (i, (cs, ts)) in curr_srgb.iter().zip(targ_srgb.iter()).enumerate() {
-            let new_color = interpolate_color_hsv(*cs, *ts, step, config.transition_steps);
-            step_buffer[i] = srgb_to_color(new_color);
-        }
+        let t = step as f32 / config.transition_steps as f32;
+
+        step_buffer
+            .par_iter_mut()
+            .enumerate()
+            .for_each(|(i, buf)| {
+                let new_color = interpolate_color_hsv(curr_srgb[i], targ_srgb[i], t);
+                *buf = srgb_to_color(new_color);
+            });
+
         openrgb_client.update_leds(controller_id, step_buffer.to_vec()).await?;
         current.copy_from_slice(step_buffer);
         tokio::time::sleep(Duration::from_millis(config.transition_delay_ms)).await;

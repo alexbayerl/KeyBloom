@@ -5,8 +5,12 @@
 //! `crossterm` for handling user input in a terminal environment.
 
 use std::io;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+use std::sync::atomic::{AtomicBool, Ordering}; // NEW
 
+use crate::config::Config;
+use crate::sync_loop::{start_sync_loop, SyncStatus};
 use crossterm::event::{
     self, DisableMouseCapture, EnableMouseCapture, Event as CEvent, KeyCode, KeyEventKind,
 };
@@ -17,19 +21,20 @@ use crossterm::terminal::{
 use ratatui::backend::{Backend, CrosstermBackend};
 use ratatui::layout::{Alignment, Constraint, Direction};
 use ratatui::style::{Color as RColor, Modifier, Style};
-use ratatui::style::Color::Rgb;
+use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, List, ListItem, Paragraph};
 use ratatui::{Frame, Terminal};
+use std::thread;
 
-use crate::config::Config;
+// Define a new error type that implements Send + Sync + 'static
+type AnyError = Box<dyn std::error::Error + Send + Sync + 'static>;
 
 /// Represents the TUI's input mode for editing a configuration field or just navigating.
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Clone)]
 pub enum InputMode {
-    /// Normal navigation mode.
     Normal,
-    /// Editing mode for the currently selected configuration field.
     Editing,
+    Syncing,
 }
 
 /// The main application state for the TUI.
@@ -40,7 +45,7 @@ pub struct App {
     pub options: Vec<&'static str>,
     /// Descriptions for each configuration option to display to the user.
     pub descriptions: Vec<&'static str>,
-    /// Indicates whether we're in `Normal` or `Editing` mode.
+    /// Indicates whether we're in `Normal`, `Editing`, or `Syncing` mode.
     pub input_mode: InputMode,
     /// The temporary buffer that holds user input when editing.
     pub input: String,
@@ -48,6 +53,12 @@ pub struct App {
     pub list_state: ratatui::widgets::ListState,
     /// Indicates whether the UI needs to be redrawn.
     pub dirty: bool,
+    /// Shared synchronization status (updated by the sync loop).
+    pub sync_status: Arc<Mutex<SyncStatus>>,
+    /// Handle to the running sync loop, if any.
+    pub sync_handle: Option<thread::JoinHandle<()>>,
+    /// Shared stop signal to gracefully terminate the sync loop.
+    pub stop_signal: Arc<AtomicBool>, // NEW
 }
 
 impl App {
@@ -55,6 +66,7 @@ impl App {
     pub fn new(config: Config) -> Self {
         let mut list_state = ratatui::widgets::ListState::default();
         list_state.select(Some(0));
+
         App {
             config,
             options: vec![
@@ -91,6 +103,9 @@ impl App {
             input: String::new(),
             list_state,
             dirty: true,
+            sync_status: Arc::new(Mutex::new(SyncStatus::default())),
+            sync_handle: None,
+            stop_signal: Arc::new(AtomicBool::new(false)), // NEW
         }
     }
 
@@ -124,6 +139,7 @@ impl App {
         self.input_mode = match self.input_mode {
             InputMode::Normal => InputMode::Editing,
             InputMode::Editing => InputMode::Normal,
+            InputMode::Syncing => InputMode::Syncing,
         };
         if self.input_mode == InputMode::Editing {
             let selected = self.list_state.selected().unwrap_or(0);
@@ -142,7 +158,8 @@ impl App {
                 11 => self.config.monitor_index.to_string(),
                 _ => "".to_string(),
             };
-        } else {
+        } else if self.input_mode == InputMode::Normal {
+            // Clear input if returning from editing
             self.input.clear();
         }
         self.dirty = true;
@@ -150,8 +167,8 @@ impl App {
 
     /// Update the `config` with the contents of `self.input` for the selected option.
     ///
-    /// This method attempts to parse the input for numeric fields or assigns
-    /// it directly for string fields. If parsing fails, the old value is retained.
+    /// Tries to parse numeric fields or assigns for string fields. If parsing fails,
+    /// the old value is retained.
     pub fn update_config(&mut self) {
         if let Some(selected) = self.list_state.selected() {
             match selected {
@@ -205,16 +222,70 @@ impl App {
         }
         self.dirty = true;
     }
+
+    /// Start the actual sync loop in background (spawning a new thread with its own Tokio runtime).
+    pub fn start_sync(&mut self) {
+        // Reset to false in case we had a previous run
+        self.stop_signal.store(false, Ordering::Relaxed); // NEW
+
+        let config = self.config.clone();
+        let sync_status = Arc::clone(&self.sync_status);
+        let stop_signal = Arc::clone(&self.stop_signal); // NEW
+
+        // Spawn the sync loop in a new thread to avoid Send requirement
+        let handle = std::thread::spawn(move || {
+            // Create a new Tokio runtime for the spawned thread
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("Failed to create Tokio runtime");
+
+            // Run the async sync loop within the runtime
+            rt.block_on(async {
+                if let Err(err) = start_sync_loop(&config, sync_status, stop_signal).await { // MODIFIED
+                    eprintln!("Error in sync loop: {err}");
+                }
+            });
+        });
+        self.sync_handle = Some(handle);
+
+        // Switch to sync mode
+        self.input_mode = InputMode::Syncing;
+        self.dirty = true;
+    }
+
+    /// Abort the sync loop (if running) and return to the normal mode.
+    pub fn stop_sync(&mut self) {
+        // Tell the sync loop to break from its while-loop
+        self.stop_signal.store(true, Ordering::Relaxed); // NEW
+
+        if let Some(handle) = self.sync_handle.take() {
+            // This will now return quickly, because the sync loop sees stop_signal == true
+            handle.join().unwrap_or_else(|e| {
+                eprintln!("Failed to join sync thread: {:?}", e);
+            });
+        }
+
+        self.input_mode = InputMode::Normal;
+        self.dirty = true;
+    }
 }
 
-/// Draws the main TUI layout onto the frame.
+/// Renders the main TUI layout onto the frame.
 ///
 /// # Arguments
 ///
 /// * `f` - The frame to draw onto.
 /// * `app` - The current state of the TUI application.
-pub fn ui(f: &mut Frame, app: &mut App) {
-    let area = f.area();
+pub fn ui(f: &mut Frame<'_>, app: &mut App) {
+    match app.input_mode {
+        InputMode::Normal | InputMode::Editing => render_menu(f, app),
+        InputMode::Syncing => render_sync_screen(f, app),
+    }
+}
+
+fn render_menu(f: &mut Frame<'_>, app: &mut App) {
+    let area = f.size();
     let chunks = ratatui::layout::Layout::default()
         .direction(Direction::Vertical)
         .margin(1)
@@ -222,7 +293,7 @@ pub fn ui(f: &mut Frame, app: &mut App) {
             Constraint::Length(6),
             Constraint::Min(10),
             Constraint::Length(5),
-            Constraint::Length(3),
+            Constraint::Length(5),
             Constraint::Length(2),
             Constraint::Length(1),
         ])
@@ -288,7 +359,7 @@ pub fn ui(f: &mut Frame, app: &mut App) {
         .alignment(Alignment::Left);
     f.render_widget(desc_paragraph, chunks[2]);
 
-    // Input/edit area
+    // Input/edit area or Instructions
     let input_block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded);
@@ -307,9 +378,10 @@ pub fn ui(f: &mut Frame, app: &mut App) {
         // Place the cursor at the end of the input
         let cursor_x = chunks[3].x + app.input.len() as u16 + 1;
         let cursor_y = chunks[3].y + 1;
-        f.set_cursor_position((cursor_x, cursor_y));
+        f.set_cursor(cursor_x, cursor_y);
     } else {
         let help_block = input_block
+            .clone()
             .title("Instructions")
             .title_alignment(Alignment::Center);
         let info_text = "Press 'q' to exit. Use ↑↓ to navigate. Press Enter to edit.";
@@ -322,93 +394,177 @@ pub fn ui(f: &mut Frame, app: &mut App) {
 
     // Author signature
     let author_paragraph = Paragraph::new("Alexander Bayerl | With ❤️ from Austria")
-        .style(Style::default().fg(Rgb(255, 214, 0)))
+        .style(Style::default().fg(RColor::Rgb(255, 214, 0)))
         .alignment(Alignment::Right);
     f.render_widget(author_paragraph, chunks[5]);
+}
+
+fn render_sync_screen(f: &mut Frame<'_>, app: &mut App) {
+    let sync_status = app.sync_status.lock().unwrap();
+
+    // Define layout
+    let chunks = ratatui::layout::Layout::default()
+        .direction(Direction::Vertical)
+        .margin(2)
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Min(1),
+            Constraint::Length(5),
+        ])
+        .split(f.size());
+
+    // Header
+    let header = Paragraph::new("🔄 Synchronization in Progress")
+        .style(Style::default().fg(RColor::Yellow).add_modifier(Modifier::BOLD))
+        .alignment(Alignment::Center);
+    f.render_widget(header, chunks[0]);
+
+    // Body - Display current colors
+    let colors = &sync_status.current_colors;
+    let color_blocks: Vec<ListItem> = colors
+        .iter()
+        .enumerate()
+        .map(|(i, color)| {
+            let line = Line::from(vec![
+                Span::styled(format!("LED {}: ", i + 1), Style::default().add_modifier(Modifier::BOLD)),
+                Span::styled("     ", Style::default().bg(RColor::Rgb(color.r, color.g, color.b))),
+            ]);
+            ListItem::new(line)
+        })
+        .collect();
+
+    let list = List::new(color_blocks)
+        .block(Block::default().title("Current LED Colors").borders(Borders::ALL))
+        .style(Style::default());
+    f.render_widget(list, chunks[1]);
+
+    // Footer with controls
+    let footer = Paragraph::new("Press 'm' to return to Menu | 'q' to Quit")
+        .style(Style::default().fg(RColor::Gray))
+        .alignment(Alignment::Center);
+    f.render_widget(footer, chunks[2]);
 }
 
 /// Runs the TUI application loop, handling events and rendering.
 ///
 /// # Arguments
 ///
-/// * `terminal` - A mutable reference to a `Terminal` that uses the provided backend.
-/// * `app` - The TUI application state.
-pub fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app: App) -> io::Result<App> {
+/// * `terminal` - A mutable reference to a `Terminal`.
+/// * `app` - A mutable reference to the TUI application state.
+///
+/// # Returns
+///
+/// An `AnyError` if an error occurs during the run.
+pub async fn run_app<B: Backend>(
+    terminal: &mut Terminal<B>,
+    app: &mut App,
+) -> Result<(), AnyError> {
     let tick_rate = Duration::from_millis(200);
     let mut last_tick = Instant::now();
-    let mut should_quit = false;
 
-    while !should_quit {
+    loop {
         let now = Instant::now();
         let timeout = tick_rate
             .checked_sub(last_tick.elapsed())
             .unwrap_or_else(|| Duration::from_secs(0));
-
+    
         if app.dirty || last_tick.elapsed() >= tick_rate {
-            terminal.draw(|f| ui(f, &mut app))?;
+            terminal.draw(|f| ui(f, app))?;
             app.dirty = false;
             last_tick = now;
         }
-
+    
         if event::poll(timeout)? {
             if let CEvent::Key(key) = event::read()? {
                 if key.kind == KeyEventKind::Press {
+                    let key_char = match key.code {
+                        KeyCode::Char(c) => Some(c.to_ascii_lowercase()),
+                        _ => None,
+                    };
+    
+                    if let Some(c) = key_char {
+                        match c {
+                            'm' => {
+                                if app.input_mode == InputMode::Syncing {
+                                    app.stop_sync();
+                                } else {
+                                    // Define behavior for 'm' in other modes if needed
+                                }
+                                continue; // Skip further processing
+                            }
+                            'q' => {
+                                if app.input_mode == InputMode::Syncing {
+                                    app.stop_sync();
+                                }
+                                break;
+                            }
+                            _ => {}
+                        }
+                    }
+    
+                    // Handle other keys based on input mode
                     match app.input_mode {
-                        InputMode::Normal => match key.code {
-                            KeyCode::Char('q') => {
-                                should_quit = true;
-                            }
-                            KeyCode::Down => {
-                                app.next();
-                            }
-                            KeyCode::Up => {
-                                app.previous();
-                            }
-                            KeyCode::Enter => {
-                                if let Some(selected) = app.list_state.selected() {
-                                    // "Save and Sync" is the last option
-                                    if selected == app.options.len() - 1 {
-                                        match app.config.save() {
-                                            Ok(_) => {
-                                                eprintln!("Configuration saved successfully.");
-                                                should_quit = true;
+                        InputMode::Normal => {
+                            match key.code {
+                                KeyCode::Down => {
+                                    app.next();
+                                }
+                                KeyCode::Up => {
+                                    app.previous();
+                                }
+                                KeyCode::Enter => {
+                                    if let Some(selected) = app.list_state.selected() {
+                                        // "Save and Sync" is the last option
+                                        if selected == app.options.len() - 1 {
+                                            // Attempt to save configuration
+                                            match app.config.save() {
+                                                Ok(_) => {
+                                                    eprintln!("Configuration saved successfully.");
+                                                    // Now start the sync
+                                                    app.start_sync();
+                                                }
+                                                Err(err) => {
+                                                    eprintln!("Failed to save configuration: {}", err);
+                                                }
                                             }
-                                            Err(err) => {
-                                                eprintln!("Failed to save configuration: {}", err);
-                                            }
+                                        } else {
+                                            app.toggle_edit();
                                         }
-                                    } else {
-                                        app.toggle_edit();
                                     }
                                 }
+                                _ => {}
                             }
-                            _ => {}
-                        },
-                        InputMode::Editing => match key.code {
-                            KeyCode::Enter => {
-                                app.update_config();
-                                app.toggle_edit();
+                        }
+                        InputMode::Editing => {
+                            match key.code {
+                                KeyCode::Enter => {
+                                    app.update_config();
+                                    app.toggle_edit();
+                                }
+                                KeyCode::Char(c) => {
+                                    app.input.push(c);
+                                    app.dirty = true;
+                                }
+                                KeyCode::Backspace => {
+                                    app.input.pop();
+                                    app.dirty = true;
+                                }
+                                KeyCode::Esc => {
+                                    app.toggle_edit();
+                                }
+                                _ => {}
                             }
-                            KeyCode::Char(c) => {
-                                app.input.push(c);
-                                app.dirty = true;
-                            }
-                            KeyCode::Backspace => {
-                                app.input.pop();
-                                app.dirty = true;
-                            }
-                            KeyCode::Esc => {
-                                app.toggle_edit();
-                            }
-                            _ => {}
-                        },
+                        }
+                        InputMode::Syncing => {
+                            // Handle other keys if necessary
+                        }
                     }
                 }
             }
         }
     }
 
-    Ok(app) // Return the updated App
+    Ok(())
 }
 
 /// Launches the TUI menu in raw mode and restores the terminal upon exit.
@@ -416,17 +572,23 @@ pub fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app: App) -> io::Resu
 /// # Arguments
 ///
 /// * `config` - A mutable reference to the current KeyBloom configuration.
-pub fn show_menu(config: &mut Config) -> io::Result<()> {
+pub async fn show_menu(config: &mut Config) -> io::Result<()> {
+    let mut app = App::new(config.clone());
+
+    // Start up the TUI
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let app = App::new(config.clone());
-    let updated_app = run_app(&mut terminal, app)?; // Receive the updated App
-
-    *config = updated_app.config; // Update the main Config with changes from the TUI
+    let run_result = match run_app(&mut terminal, &mut app).await {
+        Ok(_) => Ok(()),
+        Err(err) => {
+            eprintln!("Error running TUI menu: {}", err);
+            Err(io::Error::new(io::ErrorKind::Other, err))
+        }
+    };
 
     disable_raw_mode()?;
     execute!(
@@ -436,5 +598,11 @@ pub fn show_menu(config: &mut Config) -> io::Result<()> {
     )?;
     terminal.show_cursor()?;
 
-    Ok(())
+    // Abort sync if it's running
+    app.stop_sync();
+
+    // Reload config from disk if user selected "Save and Sync"
+    *config = Config::load();
+
+    run_result
 }
