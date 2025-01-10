@@ -1,0 +1,21 @@
+[package]
+name = "KeyBloom"
+authors = ["Alexander Bayerl"]
+version = "1.0.0"
+edition = "2021"
+
+[dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+openrgb = "0.1.2"
+xcap = "0.2.1"
+image = "0.25.5"
+palette = "0.7.2" 
+rayon = "1.5"
+ocl = "0.19.7"
+# Dependencies for Configuration and Terminal GUI
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+toml = "0.7"
+crossterm = "0.26.0"
+directories = "5.0.0"
+ratatui = "0.29.0"
