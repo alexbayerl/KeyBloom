@@ -15,11 +15,6 @@ use crate::sync_loop::{start_sync_loop, SyncLoopExit};
 use crate::ui::show_menu;
 use std::error::Error;
 
-/// Asynchronous main function for KeyBloom.
-///
-/// Launches the TUI menu, lets the user configure settings, and then starts
-/// the synchronization loop that captures screen colors and updates the
-/// OpenRGB device in real-time.
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     // Load or create default config

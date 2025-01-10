@@ -15,7 +15,7 @@ use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
 use ratatui::backend::{Backend, CrosstermBackend};
-use ratatui::layout::{Alignment, Constraint, Direction, Layout};
+use ratatui::layout::{Alignment, Constraint, Direction};
 use ratatui::style::{Color as RColor, Modifier, Style};
 use ratatui::style::Color::Rgb;
 use ratatui::widgets::{Block, BorderType, Borders, List, ListItem, Paragraph};
@@ -214,8 +214,8 @@ impl App {
 /// * `f` - The frame to draw onto.
 /// * `app` - The current state of the TUI application.
 pub fn ui(f: &mut Frame, app: &mut App) {
-    let area = f.size();
-    let chunks = Layout::default()
+    let area = f.area();
+    let chunks = ratatui::layout::Layout::default()
         .direction(Direction::Vertical)
         .margin(1)
         .constraints([
@@ -307,7 +307,7 @@ pub fn ui(f: &mut Frame, app: &mut App) {
         // Place the cursor at the end of the input
         let cursor_x = chunks[3].x + app.input.len() as u16 + 1;
         let cursor_y = chunks[3].y + 1;
-        f.set_cursor(cursor_x, cursor_y);
+        f.set_cursor_position((cursor_x, cursor_y));
     } else {
         let help_block = input_block
             .title("Instructions")

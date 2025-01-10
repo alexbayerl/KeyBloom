@@ -14,7 +14,7 @@ use crate::config::Config;
 use image::RgbaImage;
 use openrgb::{data::Color, OpenRGB, OpenRGBError};
 use palette::Srgb;
-use rayon::prelude::*;
+use rayon::prelude::*; // For parallel iterators
 use std::error::Error;
 use std::time::{Duration, Instant};
 use tokio::time::sleep;
@@ -57,6 +57,7 @@ pub async fn start_sync_loop(config: &Config) -> Result<SyncLoopExit, Box<dyn Er
     let mut keyboard_id: Option<u32> = None;
     for i in 0..controller_count {
         if let Ok(ctrl) = client.get_controller(i).await {
+            // You can refine this matching logic if needed
             if ctrl.name.contains(&config.device_name)
                 || ctrl.name.to_lowercase().contains("keyboard")
             {
@@ -100,6 +101,7 @@ pub async fn start_sync_loop(config: &Config) -> Result<SyncLoopExit, Box<dyn Er
     let mut last_transition = Instant::now();
     let mut step_buffer = vec![Color { r: 0, g: 0, b: 0 }; config.num_leds];
     let color_threshold_sq = (config.color_change_threshold * 255.0).powi(2);
+    let width = monitor.width() as usize;
 
     // Main capture-and-update loop
     loop {
@@ -130,30 +132,48 @@ pub async fn start_sync_loop(config: &Config) -> Result<SyncLoopExit, Box<dyn Er
                 continue;
             }
         };
-        let width = frame.width();
-        let height = frame.height();
 
-        // Sum up pixel values in vertical segments
-        let mut sums = vec![(0u64, 0u64, 0u64, 0u64); config.num_leds];
-        for y in 0..height {
-            for x in 0..width {
-                let pixel = frame.get_pixel(x, y);
-                let alpha = pixel[3] as f32 / 255.0;
-                if alpha >= 0.1 {
-                    let col_idx = (x as usize * config.num_leds) / width as usize;
-                    let (r, g, b, c) = &mut sums[col_idx];
-                    *r += pixel[0] as u64;
-                    *g += pixel[1] as u64;
-                    *b += pixel[2] as u64;
-                    *c += 1;
+        let mut sums = frame
+            .par_chunks_exact(width * 4)
+            .map(|row_slice| {
+                let mut row_sums = vec![(0u64, 0u64, 0u64, 0u64); config.num_leds];
+                for x in 0..width {
+                    let idx = x * 4;
+                    let r = row_slice[idx] as u64;
+                    let g = row_slice[idx + 1] as u64;
+                    let b = row_slice[idx + 2] as u64;
+                    let a = row_slice[idx + 3] as f32 / 255.0;
+
+                    if a >= 0.1 {
+                        // Which LED column does this pixel belong to?
+                        let col_idx = (x * config.num_leds) / width;
+                        let (rr, gg, bb, count) = &mut row_sums[col_idx];
+                        *rr += r;
+                        *gg += g;
+                        *bb += b;
+                        *count += 1;
+                    }
                 }
-            }
-        }
+                row_sums
+            })
+            .reduce(
+                || vec![(0u64, 0u64, 0u64, 0u64); config.num_leds],
+                |mut acc, row_sums| {
+                    for (i, (r, g, b, c)) in row_sums.into_iter().enumerate() {
+                        let s = &mut acc[i];
+                        s.0 += r;
+                        s.1 += g;
+                        s.2 += b;
+                        s.3 += c;
+                    }
+                    acc
+                },
+            );
 
         // Convert sums to target colors, adjusting brightness & saturation
         let target_srgb: Vec<Srgb<f32>> = sums
-            .into_par_iter()
-            .map(|(r_sum, g_sum, b_sum, count)| {
+            .par_iter()
+            .map(|&(r_sum, g_sum, b_sum, count)| {
                 if count == 0 {
                     Srgb::new(0.0, 0.0, 0.0)
                 } else {
@@ -167,6 +187,7 @@ pub async fn start_sync_loop(config: &Config) -> Result<SyncLoopExit, Box<dyn Er
                 }
             })
             .collect();
+
         let target_colors: Vec<Color> = target_srgb.iter().map(|&c| srgb_to_color(c)).collect();
 
         // Check if a significant color change occurred
@@ -210,7 +231,7 @@ pub async fn start_sync_loop(config: &Config) -> Result<SyncLoopExit, Box<dyn Er
 }
 
 /// Smoothly transition `current` colors to `target` colors using HSV interpolation.
-/// 
+///
 /// This function performs several incremental steps (specified in `config.transition_steps`)
 /// and updates the keyboard LEDs at each step.
 ///
